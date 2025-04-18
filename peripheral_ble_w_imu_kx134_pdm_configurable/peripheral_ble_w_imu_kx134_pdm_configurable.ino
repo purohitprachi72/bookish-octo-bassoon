@@ -5,6 +5,7 @@
 #include "LSM6DS3.h"
 #include <Adafruit_SPIFlash.h>
 #include <Adafruit_TinyUSB.h>
+#include <PDM.h>
 
 Adafruit_FlashTransport_QSPI flashTransport;
 
@@ -29,9 +30,9 @@ TaskHandle_t TASK_H = NULL;
 
 enum SelectSensor {
   NONE = 0x00,
-  KX134 = 0x01,
-  IMU = 0x02,
-  PDM = 0x03
+  KX134_ = 0x01,
+  IMU_ = 0x02,
+  PDM_ = 0x03
 };
 
 volatile uint16_t odr_value = 0;
@@ -39,9 +40,19 @@ volatile uint16_t duration = 0;
 volatile SelectSensor init_sensor = NONE;
 volatile bool start_sampling = false;
 
+LSM6DS3 myIMU(I2C_MODE, 0x6A);  // Global IMU object
 uint16_t sampleRate = 1660;
 
+SparkFun_KX134_SPI kxAccel;  // Global KX object
+rawOutputData myData;
 const byte chipSelect = 1;
+
+// PDM specific variables
+short pdmSampleBuffer[256];
+volatile int pdmSamplesRead = 0;
+volatile bool pdmSamplingActive = false;
+volatile uint32_t pdmSamplesCollected = 0;
+volatile uint32_t pdmTotalSamplesToCollect = 0;
 
 // Maximum buffer size (adjust according to your RAM)
 #define MAX_BUFFER_SIZE 200000
@@ -108,15 +119,15 @@ void sWriteCallback(uint16_t conn_handle, BLECharacteristic* chr, uint8_t* data,
     transmitting = false;
 
     switch (init_sensor) {
-      case KX134:
+      case KX134_:
         initFunction = initKX134;
         sampleFunction = sampleKX134;
         break;
-      case IMU:
+      case IMU_:
         initFunction = initIMU;
         sampleFunction = sampleIMU;
         break;
-      case PDM:
+      case PDM_:
         initFunction = initPDM;
         sampleFunction = samplePDM;
         break;
@@ -212,8 +223,6 @@ void sendBufferOverBLE() {
 void initKX134() {
   // Initialize KX134 sensor
   Serial.println("Initializing KX134...");
-  SparkFun_KX134_SPI kxAccel;
-  rawOutputData myData;
 
   pinMode(chipSelect, OUTPUT);
   digitalWrite(chipSelect, HIGH);
@@ -222,7 +231,8 @@ void initKX134() {
   SPISettings settings(8000000, MSBFIRST, SPI_MODE0);
   if (!kxAccel.begin(SPI, settings, chipSelect)) {
     Serial.println("Could not communicate with the KX13X sensor. Halting.");
-    while (1);
+    while (1)
+      ;
   }
 
   if (kxAccel.softwareReset()) {
@@ -233,11 +243,18 @@ void initKX134() {
   kxAccel.enableAccel(false);
   kxAccel.setRange(SFE_KX134_RANGE64G);
   kxAccel.enableDataEngine();
-  kxAccel.setOutputDataRate(14);  // Set to a value corresponding to ~8KHz
-  kxAccel.enableAccel();
 }
 
 void sampleKX134(uint16_t odr, uint16_t duration) {
+
+  if (odr == 5000) {
+    kxAccel.setOutputDataRate(13);
+  } else {
+    kxAccel.setOutputDataRate(14);
+  }
+
+  kxAccel.enableAccel();
+
   Serial.print("Sampling KX134 with ODR: ");
   Serial.print(odr);
   Serial.print(" for duration: ");
@@ -248,13 +265,15 @@ void sampleKX134(uint16_t odr, uint16_t duration) {
 
   // Calculate total samples based on ODR and duration
   uint32_t totalSamples = odr * duration;
-  uint32_t bytesPerSample = 6 * sizeof(int16_t);  // 3 axes, each 2 bytes
+  uint32_t bytesPerSample = 3 * sizeof(int16_t);  // 3 axes, each 2 bytes
   uint32_t totalBytes = totalSamples * bytesPerSample;
 
   // Check if buffer is large enough
   if (totalBytes > MAX_BUFFER_SIZE) {
     Serial.println("ERROR: Buffer too small for requested duration");
-    return;
+    totalBytes = MAX_BUFFER_SIZE;
+    Serial.println("Setting totalBytes = MAX_BUFFER_SIZE (200000)");
+    // return;
   }
 
   // Calculate microseconds per sample
@@ -277,11 +296,12 @@ void sampleKX134(uint16_t odr, uint16_t duration) {
 
     // Example data collection (replace with actual reading code)
     // kx134.readAccelData(&x, &y, &z);
+    kxAccel.getRawAccelData(&myData);
 
     // For simulation, generate dummy data
-    x = random(-32768, 32767);
-    y = random(-32768, 32767);
-    z = random(-32768, 32767);
+    x = myData.xData;
+    y = myData.yData;
+    z = myData.zData;
 
     // Store values in buffer (each axis is 2 bytes)
     memcpy(&sensorBuffer[bufferIndex], &x, sizeof(int16_t));
@@ -293,13 +313,13 @@ void sampleKX134(uint16_t odr, uint16_t duration) {
 
     // For KX134, we'd only have acceleration data (no gyro)
     // But for consistency with IMU, we'll add zero values for gyro
-    int16_t zero = 0;
-    memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
-    bufferIndex += sizeof(int16_t);
-    memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
-    bufferIndex += sizeof(int16_t);
-    memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
-    bufferIndex += sizeof(int16_t);
+    // int16_t zero = 0;
+    // memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
+    // bufferIndex += sizeof(int16_t);
+    // memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
+    // bufferIndex += sizeof(int16_t);
+    // memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
+    // bufferIndex += sizeof(int16_t);
   }
 
   Serial.print("Collected ");
@@ -308,8 +328,6 @@ void sampleKX134(uint16_t odr, uint16_t duration) {
 
   bufferReady = true;
 }
-
-LSM6DS3 myIMU(I2C_MODE, 0x6A);  // Global IMU object
 
 void initIMU() {
   // Initialize IMU sensor
@@ -321,11 +339,13 @@ void initIMU() {
   myIMU.settings.gyroBandWidth = 500;
   myIMU.settings.tempEnabled = 0;
 
+  delay(50);
+
   if (myIMU.begin() != 0) {
     Serial.println("IMU setup complete");
   } else {
     Serial.println("IMU setup failed!");
-    return;
+    // return;
   }
 
   Wire1.setClock(400000);  // For faster I2C read
@@ -352,7 +372,9 @@ void sampleIMU(uint16_t odr, uint16_t duration) {
   // Check if buffer is large enough
   if (totalBytes > MAX_BUFFER_SIZE) {
     Serial.println("ERROR: Buffer too small for requested duration");
-    return;
+    totalBytes = MAX_BUFFER_SIZE;
+    Serial.println("Setting totalBytes = MAX_BUFFER_SIZE (200000)");
+    // return;
   }
 
   // Calculate microseconds per sample
@@ -400,10 +422,66 @@ void sampleIMU(uint16_t odr, uint16_t duration) {
   bufferReady = true;
 }
 
+// PDM callback function - called when PDM data is available
+void onPDMdata() {
+  // Only process data if we're actively sampling
+  if (!pdmSamplingActive) return;
+
+  // Query the number of bytes available
+  int bytesAvailable = PDM.available();
+
+  // Read into the sample buffer
+  int bytesRead = PDM.read(pdmSampleBuffer, bytesAvailable);
+
+  // Calculate number of samples (16-bit, 2 bytes per sample)
+  pdmSamplesRead = bytesRead / 2;
+
+  // Copy data to our main sensor buffer
+  if (pdmSamplesRead > 0 && (pdmSamplesCollected < pdmTotalSamplesToCollect)) {
+    // Don't exceed our target sample count
+    int samplesToStore = min(pdmSamplesRead, pdmTotalSamplesToCollect - pdmSamplesCollected);
+
+    // Copy samples to main buffer
+    for (int i = 0; i < samplesToStore; i++) {
+      if (bufferIndex < MAX_BUFFER_SIZE - sizeof(int16_t)) {
+        memcpy(&sensorBuffer[bufferIndex], &pdmSampleBuffer[i], sizeof(int16_t));
+        bufferIndex += sizeof(int16_t);
+        pdmSamplesCollected++;
+      } else {
+        // Buffer is full
+        break;
+      }
+    }
+
+    // Check if we've collected all samples
+    if (pdmSamplesCollected >= pdmTotalSamplesToCollect) {
+      pdmSamplingActive = false;
+      bufferReady = true;
+      Serial.print("PDM collection complete. Collected ");
+      Serial.print(pdmSamplesCollected);
+      Serial.println(" samples.");
+    }
+  }
+}
+
 void initPDM() {
   // Initialize PDM sensor
   Serial.println("Initializing PDM...");
-  // Your PDM initialization code here
+
+  PDM.end();
+  PDM.onReceive(onPDMdata);
+  PDM.setGain(30);
+  PDM.setBufferSize(256);
+
+  if (!PDM.begin(1, 16000)) {
+    Serial.println("Failed to start PDM!");
+    while (1) yield();
+  }
+
+  // Reset variables
+  pdmSamplesRead = 0;
+  pdmSamplingActive = false;
+  pdmSamplesCollected = 0;
 }
 
 void samplePDM(uint16_t odr, uint16_t duration) {
@@ -414,6 +492,7 @@ void samplePDM(uint16_t odr, uint16_t duration) {
 
   // Reset buffer index
   bufferIndex = 0;
+  pdmSamplesCollected = 0;
 
   // PDM sampling will be different than IMU/KX134
   // Calculate total samples based on ODR and duration
@@ -424,41 +503,44 @@ void samplePDM(uint16_t odr, uint16_t duration) {
   // Check if buffer is large enough
   if (totalBytes > MAX_BUFFER_SIZE) {
     Serial.println("ERROR: Buffer too small for requested duration");
-    return;
+    Serial.print("Can store max ");
+    Serial.print(MAX_BUFFER_SIZE / sizeof(int16_t));
+    Serial.println(" samples");
+    pdmTotalSamplesToCollect = MAX_BUFFER_SIZE / sizeof(int16_t);
+    // return;
   }
 
-  // Calculate microseconds per sample
-  uint32_t microsPerSample = calculateMicrosPerSample(odr);
-  uint32_t nextSampleTime = micros();
+  // Start PDM sampling
+  pdmSamplingActive = true;
 
-  // Sample for the requested duration
-  for (uint32_t i = 0; i < totalSamples; i++) {
-    // Wait until it's time for the next sample
-    while (micros() < nextSampleTime) {
-      // Busy wait or yield to other tasks
-      yield();
+  // Wait for sampling to complete
+  uint32_t startTime = millis();
+  uint32_t timeout = duration * 1000 + 1000;  // Duration in ms plus 1 second buffer
+
+  while (pdmSamplingActive && (millis() - startTime < timeout)) {
+    // Monitor progress
+    if ((millis() - startTime) % 1000 == 0) {  // Print every second
+      Serial.print("PDM sampling progress: ");
+      Serial.print(pdmSamplesCollected);
+      Serial.print(" of ");
+      Serial.print(pdmTotalSamplesToCollect);
+      Serial.println(" samples");
+      delay(1);  // Ensure we don't print too frequently
     }
-
-    // Get new sample time
-    nextSampleTime += microsPerSample;
-
-    // Read PDM data (assuming you convert to PCM)
-    int16_t sample;
-
-    // Example data collection (replace with actual reading code)
-    // sample = readPDMSample();
-
-    // For simulation, generate dummy data
-    sample = random(-32768, 32767);
-
-    // Store value in buffer
-    memcpy(&sensorBuffer[bufferIndex], &sample, sizeof(int16_t));
-    bufferIndex += sizeof(int16_t);
+    yield();  // Allow other tasks to run
   }
 
-  Serial.print("Collected ");
+  // Check if we timed out
+  if (pdmSamplingActive) {
+    Serial.println("PDM sampling timed out!");
+    pdmSamplingActive = false;
+  }
+
+  Serial.print("PDM sampling complete. Collected ");
   Serial.print(bufferIndex);
-  Serial.println(" bytes of data");
+  Serial.print(" bytes (");
+  Serial.print(pdmSamplesCollected);
+  Serial.println(" samples)");
 
   bufferReady = true;
 }
@@ -474,6 +556,7 @@ void setup() {
   flashTransport.end();
 
   Serial.begin(115200);
+  Serial.flush();
   // while (!Serial) delay(10);  // Uncomment for debugging
 
   Serial.println("BLE Sensor Controller");
