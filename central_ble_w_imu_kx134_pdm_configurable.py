@@ -1,413 +1,198 @@
+#!/usr/bin/env python3
 import asyncio
 import struct
 import datetime
 import csv
-import os
-from bleak import BleakScanner, BleakClient
+import sys
+import logging
+from pathlib import Path
 
-TARGET_NAME = "AAX"
-SCAN_TIMEOUT = 10  # seconds
+from bleak import BleakScanner, BleakClient, BleakError
 
-SENSOR_SERVICE = "290bd33f-8e7e-485b-b18a-6f8d28482d75"
-AD_SERVICE = "390bd33f-8e7e-485b-b18a-6f8d28482d75"
+# ——— UUIDs must match your Arduino definitions ———
+TARGET_NAME      = "AAX"
+SCAN_TIMEOUT     = 10  # seconds
 
-NOTIFY_CHAR = "290bd33f-8e7e-485b-b18a-6f8d28482d76"
-S_WRITE_CHAR = "290bd33f-8e7e-485b-b18a-6f8d28482d77"
-AD_WRITE_CHAR = "390bd33f-8e7e-485b-b18a-6f8d28482d78"
+SENSOR_SERVICE   = "290bd33f-8e7e-485b-b18a-6f8d28482d75"
+AD_SERVICE       = "390bd33f-8e7e-485b-b18a-6f8d28482d75"
 
-desktop = os.path.join(os.path.join(os.environ['USERPROFILE']), 'Desktop')
-if not os.path.exists(desktop):
-    print("Desktop path does not exist.")
-today = datetime.datetime.now().strftime("%d-%m-%Y")
-folder_name = f"nRF52S_SensorData_{today}"
-BASE_PATH = os.path.join(desktop, folder_name)
-if not os.path.exists(BASE_PATH):
-    os.makedirs(BASE_PATH)
-    print(f"Created directory: {BASE_PATH}")
-else:
-    print(f"Directory already exists: {BASE_PATH}")
+NOTIFY_CHAR      = "290bd33f-8e7e-485b-b18a-6f8d28482d76"
+S_WRITE_CHAR     = "290bd33f-8e7e-485b-b18a-6f8d28482d77"
+AD_WRITE_CHAR    = "390bd33f-8e7e-485b-b18a-6f8d28482d78"
+
+# BLE payload limits
+BLE_MTU          = 247
+BLE_OVERHEAD     = 7
+BLE_PACKET_SIZE  = BLE_MTU - BLE_OVERHEAD
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 
 class DataCollector:
-    def __init__(self, sensor_choice, odr, duration):
-        self.sensor_choice = sensor_choice  # 1: KX134, 2: IMU, 3: PDM
+    def __init__(self, choice:int, odr:int, duration:int):
+        self.choice = choice
         self.odr = odr
         self.duration = duration
-        
-        # Calculate expected data sizes
-        if sensor_choice == 1:  # KX134 - 3 axes
-            self.bytes_per_sample = 6  # 3 int16 values (2 bytes each)
-            self.unpack_format = '<hhh'  # Little-endian, 3 short integers
-            self.value_names = ['ax', 'ay', 'az']
-        elif sensor_choice == 2:  # IMU - 6 axes
-            self.bytes_per_sample = 12  # 6 int16 values (2 bytes each)
-            self.unpack_format = '<hhhhhh'  # Little-endian, 6 short integers
-            self.value_names = ['ax', 'ay', 'az', 'gx', 'gy', 'gz']
-        else:  # PDM - audio
-            self.bytes_per_sample = 2  # 1 int16 value (2 bytes)
-            self.unpack_format = '<h'  # Little-endian, 1 short integer
-            self.value_names = ['audio']
-        
-        self.expected_samples = odr * duration
-        self.total_bytes = self.expected_samples * self.bytes_per_sample
-        
-        # Buffer for accumulating data
-        self.data_buffer = bytearray()
-        self.samples_received = 0
-        self.samples = []
-        
-        # CSV writer reference
-        self.csv_writer = None
-        self.csv_file = None
-        
-        print(f"Data collector initialized for {self.value_names}")
-        print(f"Expected samples: {self.expected_samples}")
-        print(f"Bytes per sample: {self.bytes_per_sample}")
-        print(f"Total expected bytes: {self.total_bytes}")
-    
-    def set_csv_file(self, csv_filename):
-        """Set up CSV output file"""
-        self.csv_file = open(csv_filename, 'w', newline='')
-        self.csv_writer = csv.writer(self.csv_file)
-        header = self.value_names + ["date", "timestamp"]
-        self.csv_writer.writerow(header)
-        print(f"CSV file created: {csv_filename}")
-        return self.csv_file
-    
-    def process_complete_samples(self):
-        """Process as many complete samples as possible from the buffer"""
-        samples_before = self.samples_received
-        
-        while len(self.data_buffer) >= self.bytes_per_sample:
-            # Extract one sample
-            sample_data = self.data_buffer[:self.bytes_per_sample]
-            self.data_buffer = self.data_buffer[self.bytes_per_sample:]
-            
+
+        # Determine unpack format
+        if choice == 1:
+            self.unpack_fmt = "<hhh"     # KX134: 3×int16
+            self.fields     = ["ax","ay","az"]
+        elif choice == 2:
+            self.unpack_fmt = "<hhhhhh"  # IMU: 6×int16
+            self.fields     = ["ax","ay","az","gx","gy","gz"]
+        else:
+            self.unpack_fmt = "<h"       # PDM: 1×int16
+            self.fields     = ["audio"]
+
+        self.bytes_per_sample = struct.calcsize(self.unpack_fmt)
+        self.total_samples    = odr * duration
+        self.total_bytes      = self.bytes_per_sample * self.total_samples
+
+        # Buffers and counters
+        self.buffer = bytearray()
+        self.count  = 0
+
+        # Prepare CSV file
+        desktop = Path.home() / "Desktop"
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        folder   = desktop / f"AAX_SensorData_{today_str}"
+        folder.mkdir(exist_ok=True)
+        fname    = folder / f"{self.fields[0]}_{odr}Hz_{duration}s_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv"
+        self.csv = open(fname, "w", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.csv)
+        self.writer.writerow(self.fields + ["date","time"])
+        logging.info(f"Logging to CSV: {fname}")
+
+    def process_buffer(self):
+        while len(self.buffer) >= self.bytes_per_sample and self.count < self.total_samples:
+            chunk = self.buffer[:self.bytes_per_sample]
+            del self.buffer[:self.bytes_per_sample]
             try:
-                # Unpack according to sensor type
-                values = struct.unpack(self.unpack_format, sample_data)
-                
-                # Store the sample
-                self.samples.append(values)
-                self.samples_received += 1
-                
-                # Write to CSV if writer is available
-                if self.csv_writer:
-                    now = datetime.datetime.now()
-                    date_str = now.strftime("%Y-%m-%d")
-                    time_str = now.strftime("%H:%M:%S.%f")[:-3]  # Millisecond precision
-                    row = list(values) + [date_str, time_str]
-                    self.csv_writer.writerow(row)
-                    
-                    # Flush periodically to ensure data is written
-                    if self.samples_received % 100 == 0:
-                        self.csv_file.flush()
-                
-                # Print progress periodically (every 10% of expected samples)
-                if self.samples_received % max(1, self.expected_samples // 10) == 0:
-                    percent = (self.samples_received / self.expected_samples) * 100
-                    print(f"Progress: {percent:.1f}% - Received {self.samples_received}/{self.expected_samples} samples", end="\r")
-            
+                vals = struct.unpack(self.unpack_fmt, chunk)
             except struct.error as e:
-                print(f"\nError unpacking data: {e}")
-                print(f"Data bytes (hex): {sample_data.hex()}")
-                # Skip this sample and try to recover
+                logging.warning(f"Unpack error: {e}, skipping sample")
                 continue
-        
-        # Debug: Print how many samples were processed in this call
-        if self.samples_received > samples_before:
-            print(f"Processed {self.samples_received - samples_before} new samples in this batch")
-    
-    def notification_handler(self, sender, data):
-        """Handle incoming BLE notification data"""
-        # Debug print the incoming data
-        print(f"Received data packet: {len(data)} bytes")
-        if len(data) > 0:
-            print(f"First few bytes (hex): {data[:min(10, len(data))].hex()}")
-        
-        # Add incoming data to buffer
-        self.data_buffer.extend(data)
-        
-        # Process complete samples
-        self.process_complete_samples()
-        
-        # Return True if collection is complete
-        if self.samples_received >= self.expected_samples:
-            print(f"\nCollection complete! Received {self.samples_received} sampling items.")
-            return True
-        return False
-    
-    def cleanup(self):
-        """Close files and clean up resources"""
-        if self.csv_file:
-            self.csv_file.flush()
-            self.csv_file.close()
-            print(f"CSV file closed and data saved.")
 
-async def sampling_config(client):
-    """
-    Service 1: Select which sensor to sample data from.
-    """
-    print("\nService 1: Sensor Data Sampling")
-    print("Select Sensor to sample data:")
-    print("1. Kx134 (3-axes)")
-    print("2. IMU (6 axes)")
-    print("3. PDM (audio)")
+            self.count += 1
+            now = datetime.datetime.now()
+            row = list(vals) + [now.date().isoformat(), now.time().isoformat(timespec="milliseconds")]
+            self.writer.writerow(row)
 
-    while True:
-        try:
-            choice = int(input("Select Sensor (1, 2, or 3): "))
-            if choice in [1, 2, 3]:
-                break
-            else:
-                print("Invalid choice. Please enter 1, 2, or 3.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
-    
+            # Progress every 10%
+            if self.count % max(1, self.total_samples // 10) == 0:
+                pct = 100 * self.count / self.total_samples
+                logging.info(f"Progress: {pct:.0f}% ({self.count}/{self.total_samples})")
+
+    def notification_handler(self, sender: int, data: bytearray):
+        logging.debug(f"Notify: {len(data)} bytes")
+        self.buffer.extend(data)
+        self.process_buffer()
+        return self.count >= self.total_samples
+
+    def close(self):
+        self.csv.close()
+        logging.info("CSV file closed.")
+
+
+async def configure_sensor(client: BleakClient):
+    """Let user pick sensor, ODR, duration, then start and collect data."""
+    print("\nSelect Sensor to Sample:")
+    print("  [1] KX-134 (3 axes)")
+    print("  [2] IMU    (6 axes)")
+    print("  [3] PDM    (audio)")
+    choice = int(input("Choice (1–3): "))
+    assert choice in (1,2,3)
+
+    # Preset ODR & max durations
     if choice == 1:
-        # KX-134: Three possible ODR options.
-        print("\nKX-134 Sensor selected.")
-        print("Select ODR for KX-134:")
-        print("1. 8 kHz (max 3 seconds)")
-        print("2. 5 kHz (max 6 seconds)")
-        print("3. 12.8 kHz (max 2 seconds)")
-
-        while True:
-            try:
-                odr_choice = int(input("Select ODR option (1, 2, or 3): "))
-                if odr_choice in [1, 2, 3]:
-                    break
-                else:
-                    print("Invalid choice. Please enter 1, 2, or 3.")
-            except ValueError:
-                print("Invalid input. Please enter a number.")
-
-        if odr_choice == 1:
-            odr = 8000
-            max_duration = 3
-        elif odr_choice == 2:
-            odr = 5000
-            max_duration = 6
-        else:
-            odr = 12800
-            max_duration = 2
-        sensor_name = "KX-134"
-        csv_header = "ax,ay,az"
+        odr_map = {1:(8000,4), 2:(5000,6), 3:(12800,2)}
+        odr_opt = int(input("KX-134 ODR options: [1]8kHz/4s [2]5kHz/6s [3]12.8kHz/2s → "))
+        odr, max_dur = odr_map[odr_opt]
     elif choice == 2:
-        sensor_name = "IMU"
-        odr = 2000
-        max_duration = 6
-        csv_header = "ax,ay,az,gx,gy,gz"
+        odr, max_dur = 2000, 6
     else:
-        sensor_name = "PDM"
-        odr = 5000
-        max_duration = 10
-        csv_header = "audio"
+        odr, max_dur = 16000, 6
 
-    while True:
-        try:
-            duration = int(input(f"Enter sampling duration (max {max_duration} seconds): "))
-            if 1 <= duration <= max_duration:
-                break
-            else:
-                print(f"Invalid duration. Please enter a value between 1 and {max_duration}.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
+    duration = int(input(f"Duration (1–{max_dur}s): "))
+    assert 1 <= duration <= max_dur
 
-    print(f"\nSensor Details for {sensor_name}:")
-    print(f"  Output Data Rate (ODR): {odr}")
-    print(f"  Maximum Sampling Duration: {max_duration} seconds")
-    print(f"  Selected Sampling Duration: {duration} seconds")
-    print(f"  CSV Header: {csv_header}")
+    # Pack and send config: <BHH>
+    pkt = struct.pack("<BHH", choice, odr, duration)
+    await client.write_gatt_char(S_WRITE_CHAR, pkt, response=True)
+    logging.info(f"Sent sensor config: choice={choice}, odr={odr}, duration={duration}")
 
-    # Create a binary packet with the sensor configuration
-    # Packet format: <sensor_choice (1 byte)><odr (2 bytes)><duration (2 bytes)>
-    packet = struct.pack('<BHH', choice, odr, duration)
-    print(f"Sending configuration packet (hex): {packet.hex()}")
-    
-    try:
-        # Send configuration to device
-        await client.write_gatt_char(S_WRITE_CHAR, packet)
-        print("Sensor configuration packet sent over S_WRITE_CHAR.")
-        await asyncio.sleep(1)  # Wait for device to process
-    except Exception as e:
-        print(f"Failed to write sensor configuration: {e}")
+    # Set up collector
+    collector = DataCollector(choice, odr, duration)
+
+    # Start sampling
+    input("Press Enter to START sampling…")
+    await client.write_gatt_char(S_WRITE_CHAR, b"\x01", response=True)
+    logging.info("Sampling start command sent")
+
+    # Subscribe to notifications
+    await client.start_notify(NOTIFY_CHAR, collector.notification_handler)
+    logging.info("Notifications enabled, collecting data…")
+
+    # Wait until done
+    while collector.count < collector.total_samples:
+        await asyncio.sleep(0.5)
+
+    await client.stop_notify(NOTIFY_CHAR)
+    collector.close()
+    logging.info("Sampling session complete.")
+
+
+async def configure_advertising(client: BleakClient):
+    """Let user optionally set advertising/sleep times."""
+    print("\nConfigure Advertising & Sleep (or leave default):")
+    if input("Configure? (y/N): ").lower() != "y":
         return
 
-    print("\nSend the command to start sampling data.")
-    print("Press 'Y' to start sampling or 'Q' to quit.")
-    
-    # Setup data collector
-    data_collector = DataCollector(choice, odr, duration)
-    
-    # Create output file
-    now = datetime.datetime.now()
-    filename = os.path.join(BASE_PATH, f"{sensor_name}_{odr}_ODR_{duration}_sec_{now.strftime('%Y%m%d_%H%M%S')}.csv")
-    data_collector.set_csv_file(filename)
-    print(f"Data will be logged to: {filename}")
-    
-    # Wait for user confirmation
-    while True:
-        command = input("Command: ").strip().lower()
-        if command == 'y':
-            try:
-                # Send start command (0x01 instead of 0x00)
-                start_cmd = b'\x01'
-                print(f"Sending start command (hex): {start_cmd.hex()}")
-                await client.write_gatt_char(S_WRITE_CHAR, start_cmd)
-                print("Sampling started...")
-                break
-            except Exception as e:
-                print(f"Failed to start sampling: {e}")
-                return
-        elif command == 'q':
-            print("Exiting...")
-            return
-        else:
-            print("Invalid command. Please enter 'Y' to start or 'Q' to quit.")
+    ad_time    = int(input("Advertising time (ms, 0–65535): "))
+    sleep_time = int(input("Sleep time     (s,  0–65535): "))
+    pkt = struct.pack("<HH", ad_time, sleep_time)
+    await client.write_gatt_char(AD_WRITE_CHAR, pkt, response=True)
+    logging.info(f"Sent AD config: adv={ad_time}ms, sleep={sleep_time}s")
 
-    # Create notification handler
-    def notification_callback(sender, data):
-        return data_collector.notification_handler(sender, data)
 
-    try:
-        # Enable notifications
-        await client.start_notify(NOTIFY_CHAR, notification_callback)
-        print("Notifications started. Press Ctrl+C to stop.")
-        
-        # Calculate buffer time based on expected sample count
-        # Give more buffer for larger datasets
-        buffer_time = min(5, duration + 2)  # Dynamically adjust buffer time
-        expected_time = duration + buffer_time
-        print(f"Collecting data for approximately {expected_time} seconds...")
-        
-        # Wait loop with timeout and progress updates
-        collection_start = datetime.datetime.now()
-        collection_timeout = collection_start + datetime.timedelta(seconds=expected_time)
-        
-        while datetime.datetime.now() < collection_timeout:
-            await asyncio.sleep(0.5)  # Check every half second
-            elapsed = (datetime.datetime.now() - collection_start).total_seconds()
-            
-            # Print periodic progress update
-            if elapsed % 1 < 0.1:  # Roughly every second
-                print(f"Time elapsed: {elapsed:.1f}s / {expected_time}s - Received {data_collector.samples_received} samples")
-            
-            # If we've received all the data we expect, we can stop early
-            if data_collector.samples_received >= data_collector.expected_samples:
-                print("\nReceived all expected samples!")
-                break
-                
-        elapsed = (datetime.datetime.now() - collection_start).total_seconds()
-        print(f"\nCollection complete after {elapsed:.1f} seconds")
-        print(f"Received {data_collector.samples_received} of {data_collector.expected_samples} expected samples")
-        
-    except KeyboardInterrupt:
-        print("\nCollection interrupted by user.")
-    except Exception as e:
-        print(f"\nAn error occurred during collection: {e}")
-    finally:
-        # Cleanup
-        try:
-            await client.stop_notify(NOTIFY_CHAR)
-            print("Notifications stopped.")
-        except Exception as e:
-            print(f"Error stopping notifications: {e}")
-        
-        # Close files and cleanup
-        data_collector.cleanup()
-        if data_collector.samples_received > 0:
-            print(f"Data saved to {filename}")
-        else:
-            print("No data was collected.")
-
-async def ad_disconnect(client):
-    """
-    Service 2: Set advertising and sleep time.
-    Allows user to either send custom values or keep default (send nothing) and disconnect.
-    """
-    print("\nService 2: Set advertising and sleep time.")
-    option = input("Press 'D' to use default (do not send any data) or 'C' to configure values: ").strip().lower()
-
-    if option == 'd':
-        print("Default option selected. No data will be sent.")
-    else:
-        # Prompt for custom values.
-        while True:
-            try:
-                ad_time = int(input("Enter advertising time (0-65535 ms): "))
-                sleep_time = int(input("Enter sleep time (0-65535 seconds): "))
-                if not (0 <= ad_time <= 65535 and 0 <= sleep_time <= 65535):
-                    print("Values must be between 0 and 65535 .")
-                    continue
-                break
-            except ValueError:
-                print("Invalid input. Please enter numeric values.")
-        
-        # Pack the values and send
-        data = struct.pack('<HH', ad_time, sleep_time)
-        print(f"Sending advertising/sleep config (hex): {data.hex()}")
-
-        try:
-            await client.write_gatt_char(AD_WRITE_CHAR, data)
-            await asyncio.sleep(1)  # Wait for the command to be processed
-            print("Successfully wrote advertising and sleep times to the device.")
-        except Exception as e:
-            print(f"Failed to write to characteristic: {e}")
-
-async def scan_and_connect():
-    """Main function to scan for and connect to BLE devices"""
-    print(f"Scanning for BLE devices for {SCAN_TIMEOUT} seconds...")
+async def main():
+    logging.info(f"Scanning for '{TARGET_NAME}' for {SCAN_TIMEOUT}s…")
     devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
+    target = next((d for d in devices if d.name == TARGET_NAME), None)
+    if not target:
+        logging.error(f"No device named '{TARGET_NAME}' found.")
+        sys.exit(1)
 
-    target_device = None
-    for device in devices:
-        if device.name == TARGET_NAME:
-            target_device = device
-            break
-
-    if not target_device:
-        print(f"No device named '{TARGET_NAME}' found.")
-        return
-
-    print(f"Found {TARGET_NAME} at {target_device.address}, attempting to connect...")
-
+    logging.info(f"Found {TARGET_NAME} @ {target.address}, connecting…")
     try:
-        async with BleakClient(target_device.address) as client:
-            if client.is_connected:
-                print(f"Connected to {TARGET_NAME}!\n")
+        async with BleakClient(target.address) as client:
+            if not client.is_connected:
+                raise BleakError("Connection failed")
 
-                # print("Discovering services and characteristics...\n")
-                # services = await client.get_services()
-                # for service in services:
-                #     print(f"Service: {service.uuid} - {service.description}")
-                #     for char in service.characteristics:
-                #         props = ", ".join(char.properties)
-                #         print(f"  Characteristic: {char.uuid} - {char.description} (Properties: {props})")
-                
-                # Service selection prompt
-                print("Select Service:")
-                print("1. Service 1 (to select sensor and get sampled data)")
-                print("2. Service 2 (to set advertising and sleep time) [DEVICE WILL GET DISCONNECTED AFTERWARDS]")
+            logging.info("Connected!")
+            # await client.request_mtu(BLE_MTU)
 
-                while True:
-                    try:
-                        choice = int(input("Select Service (1 or 2): "))
-                        if choice in [1, 2]:
-                            break
-                        else:
-                            print("Invalid choice. Please enter 1 or 2.")
-                    except ValueError:
-                        print("Invalid input. Please enter a number.")
+            print("\nSelect Service:")
+            print("  [1] Sensor data sampling")
+            print("  [2] Advertising / sleep config")
+            svc = int(input("Choice (1–2): "))
+            assert svc in (1,2)
 
-                # Handle the chosen service
-                if choice == 1:
-                    await sampling_config(client)
-                elif choice == 2:
-                    await ad_disconnect(client)
+            if svc == 1:
+                await configure_sensor(client)
             else:
-                print(f"Failed to connect to {TARGET_NAME}.")
+                await configure_advertising(client)
+
     except Exception as e:
-        print(f"Connection error: {e}")
+        logging.error(f"Error: {e}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    asyncio.run(scan_and_connect())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user, exiting.")
+        sys.exit(0)
