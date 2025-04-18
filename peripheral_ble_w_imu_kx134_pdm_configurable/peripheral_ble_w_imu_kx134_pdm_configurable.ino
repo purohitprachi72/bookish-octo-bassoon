@@ -47,8 +47,8 @@ SparkFun_KX134_SPI kxAccel;  // Global KX object
 rawOutputData myData;
 const byte chipSelect = 1;
 
-// PDM specific variables
-short pdmSampleBuffer[256];
+// PDM specific variables - IMPROVED PDM SECTION
+short pdmSampleBuffer[512];  // Buffer size for PDM data
 volatile int pdmSamplesRead = 0;
 volatile bool pdmSamplingActive = false;
 volatile uint32_t pdmSamplesCollected = 0;
@@ -80,6 +80,7 @@ void sampleIMU(uint16_t odr, uint16_t duration);
 void initPDM();
 void samplePDM(uint16_t odr, uint16_t duration);
 void sendBufferOverBLE();
+void checkPDMStatus();
 
 // Calculate time between samples based on ODR
 uint32_t calculateMicrosPerSample(uint16_t odr) {
@@ -291,17 +292,13 @@ void sampleKX134(uint16_t odr, uint16_t duration) {
     // Get new sample time
     nextSampleTime += microsPerSample;
 
-    // Read KX134 data (assuming you have functions to read x, y, z)
-    int16_t x, y, z;
-
-    // Example data collection (replace with actual reading code)
-    // kx134.readAccelData(&x, &y, &z);
+    // Read KX134 data
     kxAccel.getRawAccelData(&myData);
 
-    // For simulation, generate dummy data
-    x = myData.xData;
-    y = myData.yData;
-    z = myData.zData;
+    // Store data
+    int16_t x = myData.xData;
+    int16_t y = myData.yData;
+    int16_t z = myData.zData;
 
     // Store values in buffer (each axis is 2 bytes)
     memcpy(&sensorBuffer[bufferIndex], &x, sizeof(int16_t));
@@ -310,17 +307,9 @@ void sampleKX134(uint16_t odr, uint16_t duration) {
     bufferIndex += sizeof(int16_t);
     memcpy(&sensorBuffer[bufferIndex], &z, sizeof(int16_t));
     bufferIndex += sizeof(int16_t);
-
-    // For KX134, we'd only have acceleration data (no gyro)
-    // But for consistency with IMU, we'll add zero values for gyro
-    // int16_t zero = 0;
-    // memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
-    // bufferIndex += sizeof(int16_t);
-    // memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
-    // bufferIndex += sizeof(int16_t);
-    // memcpy(&sensorBuffer[bufferIndex], &zero, sizeof(int16_t));
-    // bufferIndex += sizeof(int16_t);
   }
+
+  kxAccel.enableAccel(false);
 
   Serial.print("Collected ");
   Serial.print(bufferIndex);
@@ -415,6 +404,9 @@ void sampleIMU(uint16_t odr, uint16_t duration) {
     bufferIndex += sizeof(int16_t);
   }
 
+  myIMU.writeRegister(LSM6DS3_ACC_GYRO_CTRL1_XL, LSM6DS3_ACC_GYRO_BW_XL_400Hz | LSM6DS3_ACC_GYRO_FS_XL_16g | LSM6DS3_ACC_GYRO_ODR_XL_POWER_DOWN);
+  myIMU.writeRegister(LSM6DS3_ACC_GYRO_CTRL2_G, LSM6DS3_ACC_GYRO_ODR_G_POWER_DOWN);
+
   Serial.print("Collected ");
   Serial.print(bufferIndex);
   Serial.println(" bytes of data");
@@ -422,44 +414,58 @@ void sampleIMU(uint16_t odr, uint16_t duration) {
   bufferReady = true;
 }
 
-// PDM callback function - called when PDM data is available
+// IMPROVED PDM FUNCTIONS WITH FIXES
+
+// PDM callback function - executed when PDM data is available
 void onPDMdata() {
-  // Only process data if we're actively sampling
-  if (!pdmSamplingActive) return;
-
-  // Query the number of bytes available
+  // Get the number of bytes available
   int bytesAvailable = PDM.available();
-
+  
+  if (bytesAvailable <= 0) return;
+  
   // Read into the sample buffer
   int bytesRead = PDM.read(pdmSampleBuffer, bytesAvailable);
-
+  
+  // Only process data if we're actively sampling
+  if (!pdmSamplingActive) return;
+  
   // Calculate number of samples (16-bit, 2 bytes per sample)
-  pdmSamplesRead = bytesRead / 2;
-
+  int samplesRead = bytesRead / 2;
+  
+  // Debug output for first few samples
+  if (pdmSamplesCollected < 10) {
+    Serial.print("PDM received ");
+    Serial.print(bytesRead);
+    Serial.print(" bytes (");
+    Serial.print(samplesRead);
+    Serial.println(" samples)");
+  }
+  
   // Copy data to our main sensor buffer
-  if (pdmSamplesRead > 0 && (pdmSamplesCollected < pdmTotalSamplesToCollect)) {
+  if (samplesRead > 0 && (pdmSamplesCollected < pdmTotalSamplesToCollect)) {
     // Don't exceed our target sample count
-    int samplesToStore = min(pdmSamplesRead, pdmTotalSamplesToCollect - pdmSamplesCollected);
-
-    // Copy samples to main buffer
-    for (int i = 0; i < samplesToStore; i++) {
-      if (bufferIndex < MAX_BUFFER_SIZE - sizeof(int16_t)) {
-        memcpy(&sensorBuffer[bufferIndex], &pdmSampleBuffer[i], sizeof(int16_t));
-        bufferIndex += sizeof(int16_t);
-        pdmSamplesCollected++;
-      } else {
-        // Buffer is full
-        break;
+    int samplesToStore = min(samplesRead, pdmTotalSamplesToCollect - pdmSamplesCollected);
+    
+    // Check if we have enough space in the buffer
+    if (bufferIndex + (samplesToStore * sizeof(int16_t)) <= MAX_BUFFER_SIZE) {
+      // Copy samples to main buffer
+      memcpy(&sensorBuffer[bufferIndex], pdmSampleBuffer, samplesToStore * sizeof(int16_t));
+      bufferIndex += samplesToStore * sizeof(int16_t);
+      pdmSamplesCollected += samplesToStore;
+      
+      // Check if we've collected all samples
+      if (pdmSamplesCollected >= pdmTotalSamplesToCollect) {
+        pdmSamplingActive = false;
+        bufferReady = true;
+        Serial.print("PDM collection complete. Collected ");
+        Serial.print(pdmSamplesCollected);
+        Serial.println(" samples.");
       }
-    }
-
-    // Check if we've collected all samples
-    if (pdmSamplesCollected >= pdmTotalSamplesToCollect) {
+    } else {
+      // Buffer is full
       pdmSamplingActive = false;
       bufferReady = true;
-      Serial.print("PDM collection complete. Collected ");
-      Serial.print(pdmSamplesCollected);
-      Serial.println(" samples.");
+      Serial.println("PDM buffer is full");
     }
   }
 }
@@ -468,14 +474,25 @@ void initPDM() {
   // Initialize PDM sensor
   Serial.println("Initializing PDM...");
 
+  // End any previous PDM sessions
   PDM.end();
+  delay(100);  // Give time for cleanup
+  
+  // Configure the PDM module
   PDM.onReceive(onPDMdata);
-  PDM.setGain(30);
-  PDM.setBufferSize(256);
-
+  
+  PDM.setGain(40);  // Increase gain (0-80)
+  PDM.setBufferSize(512);  // Keep buffer size
+  
+  // Start PDM with MONO channel at 16KHz sample rate
   if (!PDM.begin(1, 16000)) {
-    Serial.println("Failed to start PDM!");
-    while (1) yield();
+    Serial.println("Failed to start PDM! Retrying...");
+    delay(1000);
+    if (!PDM.begin(1, 16000)) {  // Try again
+      Serial.println("PDM initialization failed again!");
+    }
+  } else {
+    Serial.println("PDM initialized successfully");
   }
 
   // Reset variables
@@ -485,48 +502,102 @@ void initPDM() {
 }
 
 void samplePDM(uint16_t odr, uint16_t duration) {
-  Serial.print("Sampling PDM with ODR: ");
+  Serial.print("Sampling PDM with sample rate: ");
   Serial.print(odr);
-  Serial.print(" for duration: ");
-  Serial.println(duration);
+  Serial.print(" Hz for duration: ");
+  Serial.print(duration);
+  Serial.println(" seconds");
 
-  // Reset buffer index
+  // Reset buffer index and counters
   bufferIndex = 0;
   pdmSamplesCollected = 0;
-
-  // PDM sampling will be different than IMU/KX134
+  
+  // For PDM, the ODR is our actual audio sample rate (typically 16000 Hz)
   // Calculate total samples based on ODR and duration
-  uint32_t totalSamples = odr * duration;
-  uint32_t bytesPerSample = sizeof(int16_t);  // PDM typically produces 16-bit PCM samples
-  uint32_t totalBytes = totalSamples * bytesPerSample;
+  pdmTotalSamplesToCollect = odr * duration;
+  uint32_t totalBytes = pdmTotalSamplesToCollect * sizeof(int16_t);
 
   // Check if buffer is large enough
   if (totalBytes > MAX_BUFFER_SIZE) {
-    Serial.println("ERROR: Buffer too small for requested duration");
+    Serial.println("WARNING: Buffer too small for requested duration");
     Serial.print("Can store max ");
     Serial.print(MAX_BUFFER_SIZE / sizeof(int16_t));
     Serial.println(" samples");
     pdmTotalSamplesToCollect = MAX_BUFFER_SIZE / sizeof(int16_t);
-    // return;
   }
+  
+  Serial.print("Will collect ");
+  Serial.print(pdmTotalSamplesToCollect);
+  Serial.println(" audio samples");
+
+  // Force restart PDM to ensure it's active
+  PDM.end();
+  delay(100);
+  
+  // Set callback again after PDM.end()
+  PDM.onReceive(onPDMdata);
+  PDM.setGain(40);
+  PDM.setBufferSize(512);
+  
+  if (!PDM.begin(1, 16000)) {
+    Serial.println("Failed to restart PDM!");
+    return;
+  }
+  
+  Serial.println("PDM successfully restarted for sampling");
 
   // Start PDM sampling
   pdmSamplingActive = true;
 
   // Wait for sampling to complete
   uint32_t startTime = millis();
-  uint32_t timeout = duration * 1000 + 1000;  // Duration in ms plus 1 second buffer
+  uint32_t timeout = duration * 1000 + 2000;  // Duration in ms plus 2 second buffer
+  uint32_t lastOutputTime = 0;
+  uint32_t lastDebugTime = 0;
 
   while (pdmSamplingActive && (millis() - startTime < timeout)) {
-    // Monitor progress
-    if ((millis() - startTime) % 1000 == 0) {  // Print every second
-      Serial.print("PDM sampling progress: ");
+    // Monitor progress every second
+    if (millis() - lastOutputTime >= 1000) {
+      lastOutputTime = millis();
+      Serial.print("PDM progress: ");
       Serial.print(pdmSamplesCollected);
       Serial.print(" of ");
       Serial.print(pdmTotalSamplesToCollect);
-      Serial.println(" samples");
-      delay(1);  // Ensure we don't print too frequently
+      Serial.print(" samples (");
+      Serial.print((pdmSamplesCollected * 100) / max(pdmTotalSamplesToCollect, 1)); // Avoid div by zero
+      Serial.println("%)");
     }
+    
+    // If no samples after 2 seconds, force a debug check
+    if (pdmSamplesCollected == 0 && (millis() - lastDebugTime >= 2000)) {
+      lastDebugTime = millis();
+      Serial.println("PDM Debug: No samples received yet. Checking status...");
+      
+      // Additional debug to check if callback is working
+      int bytesAvailable = PDM.available();
+      Serial.print("PDM.available() returns: ");
+      Serial.println(bytesAvailable);
+      
+      // Try reading data directly to see if PDM is working
+      if (bytesAvailable > 0) {
+        short tempBuffer[128];
+        int bytesRead = PDM.read(tempBuffer, bytesAvailable);
+        Serial.print("Direct PDM read: ");
+        Serial.print(bytesRead);
+        Serial.println(" bytes");
+        
+        // Display first few values if available
+        if (bytesRead > 0) {
+          Serial.print("First values: ");
+          for (int i = 0; i < min(5, bytesRead/2); i++) {
+            Serial.print(tempBuffer[i]);
+            Serial.print(" ");
+          }
+          Serial.println();
+        }
+      }
+    }
+    
     yield();  // Allow other tasks to run
   }
 
@@ -534,15 +605,42 @@ void samplePDM(uint16_t odr, uint16_t duration) {
   if (pdmSamplingActive) {
     Serial.println("PDM sampling timed out!");
     pdmSamplingActive = false;
+    
+    // Even if we timed out, mark what we have as ready
+    if (pdmSamplesCollected > 0) {
+      bufferReady = true;
+    }
   }
+
+  // Stop PDM
+  PDM.end();
 
   Serial.print("PDM sampling complete. Collected ");
   Serial.print(bufferIndex);
   Serial.print(" bytes (");
   Serial.print(pdmSamplesCollected);
   Serial.println(" samples)");
+}
 
-  bufferReady = true;
+// Debug function for PDM status
+void checkPDMStatus() {
+  Serial.println("\n--- PDM Status ---");
+  Serial.print("PDM active: ");
+  Serial.println(pdmSamplingActive ? "Yes" : "No");
+  Serial.print("Samples collected: ");
+  Serial.println(pdmSamplesCollected);
+  Serial.print("Target samples: ");
+  Serial.println(pdmTotalSamplesToCollect);
+  Serial.print("Buffer index: ");
+  Serial.println(bufferIndex);
+  Serial.print("Buffer ready: ");
+  Serial.println(bufferReady ? "Yes" : "No");
+  
+  // Try to read PDM directly
+  int bytesAvailable = PDM.available();
+  Serial.print("PDM.available() returns: ");
+  Serial.println(bytesAvailable);
+  Serial.println("-----------------\n");
 }
 
 void setup() {
@@ -621,6 +719,7 @@ void loop() {
 
 void connect_cb(uint16_t conn_handle) {
   Serial.println("Connected");
+  
   Bluefruit.Connection(conn_handle)->requestMtuExchange(247);
   Bluefruit.Connection(conn_handle)->requestConnectionParameter(6, 1, 10000);  // ~7.5-10 ms connection interval
   vTaskResume(TASK_H);
@@ -634,5 +733,11 @@ void disconnect_cb(uint16_t conn_handle, uint8_t reason) {
   if (transmitting) {
     transmitting = false;
     bufferReady = false;
+  }
+  
+  // Turn off PDM if it was active
+  if (pdmSamplingActive) {
+    pdmSamplingActive = false;
+    PDM.end();
   }
 }
